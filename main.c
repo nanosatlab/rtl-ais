@@ -134,7 +134,6 @@ int main(int argc, char **argv)
 			config.dev_given = 1;
 			break;
 		case 'g':
-			config.gain = (int)(atof(optarg) * 10);
 			break;
 		case 'p':
 			config.ppm_error = atoi(optarg);

@@ -47,11 +47,18 @@
 
 #define DEFAULT_ASYNC_BUF_NUMBER	12
 #define DEFAULT_BUF_LENGTH		(16 * 16384)
-#define AUTO_GAIN			-100
-
+#define PI_VALUE 				(3.141592653589793238f)
 /* signals are not threadsafe by default */
 #define safe_cond_signal(n, m) pthread_mutex_lock(m); pthread_cond_signal(n); pthread_mutex_unlock(m)
 #define safe_cond_wait(n, m) pthread_mutex_lock(m); pthread_cond_wait(n, m); pthread_mutex_unlock(m)
+
+struct pll_fll_control 
+{
+    float d_rate, d_time;
+    float d_pll_a2, d_pll_w0p, d_pll_w0p2, d_pll_w0f, d_pll_w;
+    float d_phase, d_err_hz;
+    int16_t d_last_out_i, d_last_out_q;
+};
 
 struct downsample_state
 {
@@ -68,8 +75,9 @@ struct downsample_state
 	//droop compensation
 	int16_t  droop_i_hist[9];
 	int16_t  droop_q_hist[9];
-
+	struct pll_fll_control fll;
 };
+
 
 struct demod_state
 {
@@ -219,22 +227,81 @@ static void downsample(struct downsample_state *d)
 	generic_fir(d->buf+1, (d->len_in>> ds_p)-1,cic_9_tables[ds_p], d->droop_q_hist);
 }
 
+static float pll_cloop_two_quadrant_atan(float i, float q)
+{
+	/* Why two quadrant and not four? */
+    if (i != 0.0) {
+        // return atan2f(q, i);
+		return atanf(q / i);
+    }
+    return 0.0;
+}
+
+static float fll_four_quadrant_atan(float s1_i, float s1_q, float s2_i, float s2_q, float t)
+{
+    float cross, dot;
+    dot = s1_i * s2_i + s1_q * s2_q;
+    cross = s1_i * s2_q - s2_i * s1_q;
+    return atan2f(cross, dot) / (t);
+}
+
+static void pll_fll_center(struct downsample_state *d)
+{
+	/* Try to center it */
+	float s_i, s_q, out_i, out_q;
+	const float int16_scale = 0.0078125f, int16_descale = 128.0f;
+	// const float int16_scale = 0.000030518, int16_descale = 32768.0; // Instead of *128 scale, scale it to a int16 full value
+    float pll_w_new = 0.0, PLL_Disc = 0.0, FLL_Disc = 0.0;
+	int i;
+
+	/* d->len_out is the number of (I+Q) samples, advance two by two... */
+    for(i = 0; i < d->len_out; i=i+2) {
+        // nco_out = gr_expj(d_phase);
+        s_i =  cosf(d->fll.d_phase);
+        s_q =  sinf(d->fll.d_phase);
+
+		/* We will work with scaled values between 0 and 1, preventing float overflows */
+        out_i = ((((float) d->buf[i]) * int16_scale) * s_i) - ((((float) d->buf[i+1]) * int16_scale) * s_q);
+        out_q = ((((float) d->buf[i]) * int16_scale) * s_q) + ((((float) d->buf[i+1]) * int16_scale) * s_i);
+
+        PLL_Disc = pll_cloop_two_quadrant_atan(out_i, out_q) / (2.0*PI_VALUE);
+        FLL_Disc = fll_four_quadrant_atan(d->fll.d_last_out_i, d->fll.d_last_out_q, out_i, out_q, d->fll.d_time) / (2.0*PI_VALUE);
+
+        // adjust new W: d_pll_w + PLL_Disc * d_pll_w0p2 (new d_beta)
+        pll_w_new = d->fll.d_pll_w + PLL_Disc * d->fll.d_pll_w0p2 * d->fll.d_time +    // pll
+                    FLL_Disc * d->fll.d_pll_w0f * d->fll.d_time;                       // fll
+
+        d->fll.d_err_hz  = (0.5 * (pll_w_new + d->fll.d_pll_w) + d->fll.d_pll_a2 * d->fll.d_pll_w0p * PLL_Disc * d->fll.d_time);
+        d->fll.d_phase  -= (2.0*PI_VALUE) * (d->fll.d_err_hz) / d->fll.d_rate;
+
+        d->fll.d_pll_w = pll_w_new;
+
+        d->fll.d_last_out_i = out_i;
+        d->fll.d_last_out_q = out_q;
+
+        if(d->fll.d_err_hz       > d->fll.d_rate/2.0)
+            d->fll.d_err_hz      = d->fll.d_rate/2.0;
+        else if(d->fll.d_err_hz  < -d->fll.d_rate/2.0)
+            d->fll.d_err_hz      = -d->fll.d_rate/2.0;
+
+        while(d->fll.d_phase > 2.0*PI_VALUE)
+            d->fll.d_phase -= 2.0*PI_VALUE;
+
+        while(d->fll.d_phase < -2.0*PI_VALUE)
+            d->fll.d_phase += 2.0*PI_VALUE;
+		
+		/* We re-scale (called descale here) the float to the original scale */
+		d->buf[i] = 	(int16_t) (out_i * int16_descale);
+		d->buf[i+1] = 	(int16_t) (out_q * int16_descale);	
+	}
+}
+
+
 static void multiply(int ar, int aj, int br, int bj, int *cr, int *cj)
 {
 	*cr = ar*br - aj*bj;
 	*cj = aj*br + ar*bj;
 }
-
-#if 0 // not used
-static int polar_discriminant(int ar, int aj, int br, int bj)
-{
-	int cr, cj;
-	double angle;
-	multiply(ar, aj, br, -bj, &cr, &cj);
-	angle = atan2((double)cj, (double)cr);
-	return (int)(angle / 3.14159 * (1<<14));
-}
-#endif
 
 static int fast_atan2(int y, int x)
 /* pre scaled for int16 */
@@ -384,45 +451,44 @@ static void pre_output(struct rtl_ais_context *ctx)
 
 static void *demod_thread_fn(void *arg)
 {
-        struct rtl_ais_context *ctx = arg;
-        while (ctx->active) {
-                safe_cond_wait(&ctx->ready, &ctx->ready_m);
-                pthread_rwlock_wrlock(&ctx->both.rw);
+	struct rtl_ais_context *ctx = arg;
+	while (ctx->active) {
+		safe_cond_wait(&ctx->ready, &ctx->ready_m);
+		pthread_rwlock_wrlock(&ctx->both.rw);
 		downsample(&ctx->both);
 		memcpy(ctx->left.buf,  ctx->both.buf, 2*ctx->both.len_out);
 		memcpy(ctx->right.buf, ctx->both.buf, 2*ctx->both.len_out);
 		pthread_rwlock_unlock(&ctx->both.rw);
 		rotate_90(ctx->left.buf, ctx->left.len_in);
 		downsample(&ctx->left);
-		memcpy(ctx->left_demod.buf, ctx->left.buf, 2*ctx->left.len_out);
+		/* This is at 25 KS/s --> Check it in real time */
+		/* Implement a PLL+FLL */
+		pll_fll_center(&ctx->left);
+		memcpy(ctx->left_demod.buf, ctx->left.buf, sizeof(int16_t)*ctx->left.len_out); /* Len is in SAMPLES, the 2* converts it into bytes (I+Q) */
 		demodulate(&ctx->left_demod);
 		if (ctx->dc_filter) {
-			dc_block_filter(&ctx->left_demod);}
-		//if (oversample) {
-		//	downsample(&left);}
-		//fprintf(stderr,"\nUpsample result_len:%d stereo.bl_len:%d :%f\n",left_demod.result_len,stereo.bl_len,(float)stereo.bl_len/(float)left_demod.result_len);
+			dc_block_filter(&ctx->left_demod);
+		}
 		arbitrary_upsample(ctx->left_demod.result, ctx->stereo.buf_left, ctx->left_demod.result_len, ctx->stereo.bl_len);
 		rotate_m90(ctx->right.buf, ctx->right.len_in);
 		downsample(&ctx->right);
-		memcpy(ctx->right_demod.buf, ctx->right.buf, 2*ctx->right.len_out);
+		/* This is at 25 KS/s */
+		/* Implement a PLL+FLL */
+		pll_fll_center(&ctx->right);
+		memcpy(ctx->right_demod.buf, ctx->right.buf, sizeof(int16_t)*ctx->right.len_out);
 		demodulate(&ctx->right_demod);
 		if (ctx->dc_filter) {
-			dc_block_filter(&ctx->right_demod);}
-		//if (oversample) {
-		//	downsample(&right);}
+			dc_block_filter(&ctx->right_demod);
+		}
 		arbitrary_upsample(ctx->right_demod.result, ctx->stereo.buf_right, ctx->right_demod.result_len, ctx->stereo.br_len);
 		pre_output(ctx);
 		if(ctx->use_internal_aisdecoder){
-			// stereo.result -> int_16
-			// stereo.result_len -> number of samples for each channel
 			run_rtlais_decoder(ctx->stereo.result,ctx->stereo.result_len);
-		}
-		else{
-                    fwrite(ctx->stereo.result, 2, ctx->stereo.result_len, ctx->file);
+		} else{
+			fwrite(ctx->stereo.result, 2, ctx->stereo.result_len, ctx->file);
 		}
 	}
-
-        free_ais_decoder();
+	free_ais_decoder();
 	return 0;
 }
 
@@ -442,6 +508,26 @@ static void downsample_init(struct downsample_state *dss)
 	pthread_rwlock_init(&dss->rw, NULL);
 }
 
+static void pll_fll_init(struct pll_fll_control *fll, float samp_rate, float pll_bw, float fll_bw)
+{
+	fll->d_rate      = samp_rate;
+    fll->d_time      = 1.0 / samp_rate;
+
+    fll->d_pll_a2    = 1.414;
+    fll->d_pll_w0p   = (pll_bw) / 0.53;
+
+    fll->d_pll_w0p2  = fll->d_pll_w0p * fll->d_pll_w0p;
+    fll->d_pll_w0f   = (fll_bw) / 0.25;
+
+    fll->d_pll_w     = 0.0;
+
+    fll->d_phase     = 0.0;
+    fll->d_err_hz    = 0.0;
+
+    fll->d_last_out_i  = 1.0;
+    fll->d_last_out_q  = 0.0;
+}
+
 static void demod_init(struct demod_state *ds)
 {
 	ds->buf = malloc(ds->buf_len * sizeof(int16_t));
@@ -458,31 +544,30 @@ static void stereo_init(struct upsample_stereo *us)
 
 void rtl_ais_default_config(struct rtl_ais_config *config)
 {
-        config->gain = AUTO_GAIN; /* tenths of a dB */
-        config->dev_index = 0;
-        config->dev_given = 0;
-        config->ppm_error = 0;
-        config->rtl_agc=0;
-        config->custom_ppm = 0;
-        config->left_freq = 161975000;
-        config->right_freq = 162025000;
-        config->sample_rate = 24000;
-        config->output_rate = 48000;
+	config->dev_index = 0;
+	config->dev_given = 0;
+	config->ppm_error = 0;
+	config->rtl_agc=0;
+	config->custom_ppm = 0;
+	config->left_freq = 161975000;
+	config->right_freq = 162025000;
+	config->sample_rate = 24000;
+	config->output_rate = 48000;
 	config->dc_filter=1;
-        config->edge = 0;
-        config->use_tcp_listener = 0, config->tcp_keep_ais_time = 15;
+	config->edge = 0;
+	config->use_tcp_listener = 0, config->tcp_keep_ais_time = 15;
 	config->use_internal_aisdecoder=1;
 	config->seconds_for_decoder_stats=0;
-        /* Aisdecoder */
-        config->show_levels=0;
-        config->debug_nmea = 0;
+	/* Aisdecoder */
+	config->show_levels=0;
+	config->debug_nmea =1;
 
-        config->host=NULL;
-        config->port=NULL;
+	config->host=NULL;
+	config->port=NULL;
 
-        config->filename = "-";
+	config->filename = "-";
 
-        config->add_sample_num = 0;
+	config->add_sample_num = 0;
 }
 
 struct rtl_ais_context *rtl_ais_start(struct rtl_ais_config *config)
@@ -490,16 +575,17 @@ struct rtl_ais_context *rtl_ais_start(struct rtl_ais_config *config)
 	if (config->left_freq > config->right_freq)
 		return NULL;
 
-        struct rtl_ais_context *ctx = malloc(sizeof(struct rtl_ais_context));
-        ctx->active = 1;
+	struct rtl_ais_context *ctx = malloc(sizeof(struct rtl_ais_context));
+	ctx->active = 1;
 
-        /* precompute rates */
-        int dongle_freq, dongle_rate, delta, i;
-        dongle_freq = config->left_freq/2 + config->right_freq/2;
+	/* precompute rates */
+	int dongle_freq, dongle_rate, delta, i;
+	dongle_freq = config->left_freq/2 + config->right_freq/2;
 	if (config->edge) {
-		dongle_freq -= config->sample_rate/2;}
+		dongle_freq -= config->sample_rate/2;
+	}
 	delta = config->right_freq - config->left_freq;
-        if (delta > 1.2e6) {
+	if (delta > 1.2e6) {
 		fprintf(stderr, "Frequencies may be at most 1.2MHz apart.");
 		exit(1);
 	}
@@ -507,18 +593,20 @@ struct rtl_ais_context *rtl_ais_start(struct rtl_ais_config *config)
 		fprintf(stderr, "Left channel must be lower than right channel.");
 		exit(1);
 	}
-	i = (int)log2(2.4e6 / delta);
-	dongle_rate = delta * (1<<i);
+
+	i = (int)log2(2.4e6 / delta); /* For delta = 50 KHz, i = 5 */
+	dongle_rate = delta * (1<<i); /* dongle_rate = 1 << 5 ---> 32 * 50 KHz = 1.6 MHz */
 	ctx->both.rate_in = dongle_rate;
-	ctx->both.rate_out = delta * 2;
-	i = (int)log2(ctx->both.rate_in/ctx->both.rate_out);
+	ctx->both.rate_out = delta * 2; /* This is 100 KHz (Nyquist of 50 K) */
+	i = (int)log2(ctx->both.rate_in/ctx->both.rate_out); /* Thus, 1.6M div 100 KHz --> 16--> log2 --> i = 4 */
 	ctx->both.downsample_passes = i;
 	ctx->both.downsample = 1 << i;
-	ctx->left.rate_in = ctx->both.rate_out;
-	i = (int)log2(ctx->left.rate_in / config->sample_rate);
+	ctx->left.rate_in = ctx->both.rate_out; /* This is 100 KHz */
+	i = (int)log2(ctx->left.rate_in / config->sample_rate); /* This is 24 KHz --> Freq. search from +/- 12 KHz, our sg is +/- 4.8 KHz */
+	/* i = 100 KHz / 24 KHz (pre-defined) 4 (indeed 4.1...) --> i = 2 */ 
 	ctx->left.downsample_passes = i;
 	ctx->left.downsample = 1 << i;
-	ctx->left.rate_out = ctx->left.rate_in / ctx->left.downsample;
+	ctx->left.rate_out = ctx->left.rate_in / ctx->left.downsample; /* rate out = 25 KHz (but we have asked 24 xD) */
 	
 	ctx->right.rate_in = ctx->left.rate_in;
 	ctx->right.rate_out = ctx->left.rate_out;
@@ -530,13 +618,13 @@ struct rtl_ais_context *rtl_ais_start(struct rtl_ais_config *config)
 		exit(1);
 	}
 
-        fprintf(stderr, "Buffer size: %0.2f mS\n", 1000 * (double)DEFAULT_BUF_LENGTH / (double)dongle_rate);
+	fprintf(stderr, "Buffer size: %0.2f mS\n", 1000 * (double)DEFAULT_BUF_LENGTH / (double)dongle_rate);
 	fprintf(stderr, "Downsample factor: %i\n", ctx->both.downsample * ctx->left.downsample);
 	fprintf(stderr, "Low pass: %i Hz\n", ctx->left.rate_out);
 	fprintf(stderr, "Output: %i Hz\n", config->output_rate);
 
 	/* precompute lengths */
-	ctx->both.len_in  = DEFAULT_BUF_LENGTH;
+	ctx->both.len_in  = DEFAULT_BUF_LENGTH; /* We ask for N number of bytes (I+Q) --> in this case we receive 8KSamples */
 	ctx->both.len_out = ctx->both.len_in / ctx->both.downsample;
 	ctx->left.len_in  = ctx->both.len_out;
 	ctx->right.len_in = ctx->both.len_out;
@@ -563,6 +651,8 @@ struct rtl_ais_context *rtl_ais_start(struct rtl_ais_config *config)
 	downsample_init(&ctx->both);
 	downsample_init(&ctx->left);
 	downsample_init(&ctx->right);
+	pll_fll_init(&ctx->left.fll, ctx->left.rate_out, 50, 50);
+	pll_fll_init(&ctx->right.fll, ctx->right.rate_out, 50, 50);
 	demod_init(&ctx->left_demod);
 	demod_init(&ctx->right_demod);
 	stereo_init(&ctx->stereo);
@@ -573,7 +663,7 @@ struct rtl_ais_context *rtl_ais_start(struct rtl_ais_config *config)
 		exit(1);
 	}
 
-        if(!config->use_internal_aisdecoder){
+	if(!config->use_internal_aisdecoder){
 		if (strcmp(config->filename, "-") == 0) { /* Write samples to stdout */
 			ctx->file = stdout;
 	#ifdef WIN32		
@@ -583,13 +673,12 @@ struct rtl_ais_context *rtl_ais_start(struct rtl_ais_config *config)
 		} else {
 			ctx->file = fopen(config->filename, "wb");
 			if (!ctx->file) {
-                            fprintf(stderr, "Failed to open %s\n", config->filename);
-    exit(1);
+				fprintf(stderr, "Failed to open %s\n", config->filename);
+    			exit(1);
 			}
 		}
-	}
-	else{ // Internal AIS decoder
-            int ret=init_ais_decoder(config->host,config->port,config->show_levels,config->debug_nmea,ctx->stereo.bl_len,config->seconds_for_decoder_stats, config->use_tcp_listener, config->tcp_keep_ais_time, config->add_sample_num);
+	} else{ // Internal AIS decoder
+		int ret=init_ais_decoder(config->host,config->port,config->show_levels,config->debug_nmea,ctx->stereo.bl_len,config->seconds_for_decoder_stats, config->use_tcp_listener, config->tcp_keep_ais_time, config->add_sample_num);
 		if(ret != 0){
 			fprintf(stderr,"Error initializing built-in AIS decoder\n");
 			rtlsdr_cancel_async(ctx->dev);
@@ -597,25 +686,13 @@ struct rtl_ais_context *rtl_ais_start(struct rtl_ais_config *config)
 			exit(1);
 		}
 	}
-        ctx->use_internal_aisdecoder = config->use_internal_aisdecoder;
+	ctx->use_internal_aisdecoder = config->use_internal_aisdecoder;
 
 	/* Set the tuner gain */
-	if (config->gain == AUTO_GAIN) {
-		verbose_auto_gain(ctx->dev);
-	} else {
-		config->gain = nearest_gain(ctx->dev, config->gain);
-		verbose_gain_set(ctx->dev, config->gain);
-	}
-	if(config->rtl_agc){
-		int r = rtlsdr_set_agc_mode(ctx->dev, 1);
-		if(r<0)	{
-			fprintf(stderr,"Error seting RTL AGC mode ON");
-			exit(1);
-		}
-		else {
-			fprintf(stderr,"RTL AGC mode ON\n");
-		}
-	}
+	/* Tuner gain is "hard" because of new rtl_sdr drivers */
+	// rtlsdr_set_tuner_gain_ext(ctx->dev, 1, 1, 3);
+	verbose_auto_gain(ctx->dev);
+
 	if (!config->custom_ppm) {
 		verbose_ppm_eeprom(ctx->dev, &config->ppm_error);
 	}
@@ -634,31 +711,31 @@ struct rtl_ais_context *rtl_ais_start(struct rtl_ais_config *config)
 	pthread_cond_init(&ctx->ready, NULL);
 	pthread_mutex_init(&ctx->ready_m, NULL);
 
-        /* create two threads */
+	/* create two threads */
 	pthread_create(&ctx->demod_thread, NULL, demod_thread_fn, ctx);
-        pthread_create(&ctx->rtlsdr_thread, NULL, rtlsdr_thread_fn, ctx);
+	pthread_create(&ctx->rtlsdr_thread, NULL, rtlsdr_thread_fn, ctx);
 
-        return ctx;
+	return ctx;
 }
 
 int rtl_ais_isactive(struct rtl_ais_context *ctx)
 {
-        return ctx->active;
+	return ctx->active;
 }
 
 const char *rtl_ais_next_message(struct rtl_ais_context *ctx)
 {
-        ctx = ctx; //unused for now
-        return aisdecoder_next_message();
+	ctx = ctx; //unused for now
+	return aisdecoder_next_message();
 }
 
 void rtl_ais_cleanup(struct rtl_ais_context *ctx)
 {
 	rtlsdr_cancel_async(ctx->dev);
-        ctx->active = 0;
+	ctx->active = 0;
 
-        pthread_detach(ctx->demod_thread);
-        pthread_detach(ctx->rtlsdr_thread);
+	pthread_detach(ctx->demod_thread);
+	pthread_detach(ctx->rtlsdr_thread);
 
 	if (ctx->file != stdout) {
 		if(ctx->file)
@@ -670,9 +747,9 @@ void rtl_ais_cleanup(struct rtl_ais_context *ctx)
 	pthread_cond_destroy(&ctx->ready);
 	pthread_mutex_destroy(&ctx->ready_m);
 
-        rtlsdr_close(ctx->dev);
+	rtlsdr_close(ctx->dev);
 
-        free(ctx);
+	free(ctx);
 }
 
 
